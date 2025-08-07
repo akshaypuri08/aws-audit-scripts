@@ -1,52 +1,28 @@
+from fastapi import FastAPI, Query
 import boto3
-import logging
-import os
-import sys
 from modules.nacl_review import review_nacls
-from botocore.exceptions import ClientError
+from modules.ec2_ami_audit import audit_amis
 
-# Create logs directory if it doesn't exist
-os.makedirs("logs", exist_ok=True)
+app = FastAPI()
 
-# Logging setup
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("logs/nacl_review.log", encoding='utf-8'),
-        logging.StreamHandler(sys.stdout),
-    ]
-)
+def get_session(profile_name: str):
+    return boto3.Session(profile_name=profile_name)
 
 def get_all_regions(session):
-    try:
-        ec2 = session.client("ec2", region_name="us-east-1")
-        response = ec2.describe_regions(AllRegions=False)
-        regions = [r['RegionName'] for r in response['Regions']]
-        return regions
-    except ClientError as e:
-        logging.error(f"Failed to fetch AWS regions: {e}")
-        return []
+    ec2 = session.client("ec2", region_name="us-east-1")
+    response = ec2.describe_regions(AllRegions=False)
+    return [r['RegionName'] for r in response['Regions']]
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        logging.error("Usage: python main.py <aws_profile_name>")
-        sys.exit(1)
-
-    AWS_PROFILE = sys.argv[1]
-
-    try:
-        session = boto3.Session(profile_name=AWS_PROFILE)
-    except Exception as e:
-        logging.error(f"Failed to create session with profile '{AWS_PROFILE}': {e}")
-        sys.exit(1)
-
-    regions = get_all_regions(session)
-
-    if not regions:
-        logging.error("No regions found. Exiting.")
-        sys.exit(1)
-
-    for region in regions:
-        logging.info(f"\n\n========= Scanning region: {region} =========")
+@app.get("/nacl")
+def run_nacl(profile: str = Query(..., description="AWS profile name")):
+    session = get_session(profile)
+    for region in get_all_regions(session):
         review_nacls(session, region)
+    return {"status": "NACL audit completed"}
+
+@app.get("/ami")
+def run_ami(profile: str = Query(..., description="AWS profile name")):
+    session = get_session(profile)
+    for region in get_all_regions(session):
+        audit_amis(session, region)
+    return {"status": "AMI audit completed"}
