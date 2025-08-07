@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Query
 import boto3
 from modules.nacl_review import review_nacls
-from modules.ec2_ami_audit import audit_amis
+from modules.ami_audit import audit_amis
 
 app = FastAPI()
 
@@ -16,13 +16,18 @@ def get_all_regions(session):
 @app.get("/nacl")
 def run_nacl(profile: str = Query(..., description="AWS profile name")):
     session = get_session(profile)
+    logging.info(f"========= Starting NACL scan for profile: {profile} =========")
     for region in get_all_regions(session):
         review_nacls(session, region)
+    logging.info(f"========= Completed NACL scan for profile: {profile} =========")
     return {"status": "NACL audit completed"}
+
 
 @app.get("/ami")
 def run_ami(profile: str = Query(..., description="AWS profile name")):
     session = get_session(profile)
+    logging.info(f"========= Starting AMI scan for profile: {profile} =========")
     for region in get_all_regions(session):
         audit_amis(session, region)
+    logging.info(f"========= Completed AMI scan for profile: {profile} =========")
     return {"status": "AMI audit completed"}
