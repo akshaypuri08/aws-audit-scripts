@@ -1,29 +1,51 @@
+import boto3
 import logging
+from botocore.exceptions import ClientError
 import os
 
-# Logger setup
-logger = logging.getLogger("ami_logger")
-logger.setLevel(logging.INFO)
+# Ensure logs directory exists
+os.makedirs("logs", exist_ok=True)
 
-# Prevent duplicate handlers
-if not logger.handlers:
-    os.makedirs("logs", exist_ok=True)
-    file_handler = logging.FileHandler("logs/ami_review.log", encoding="utf-8")
+# Setup AMI-specific logger
+ami_logger = logging.getLogger("AMIReviewLogger")
+ami_logger.setLevel(logging.INFO)
+
+if not ami_logger.handlers:
+    handler = logging.FileHandler("logs/ami_review.log", encoding="utf-8")
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+    handler.setFormatter(formatter)
+    ami_logger.addHandler(handler)
 
+ami_logger.info(f"\n========= Scanning Started =========")
 def audit_amis(session, region):
     try:
-        ec2 = session.client("ec2", region_name=region)
-        instances = ec2.describe_instances()
+        ami_logger.info(f"\n========= Scanning region: {region} =========")
+        ec2_client = session.client("ec2", region_name=region)
 
-        for reservation in instances['Reservations']:
-            for instance in reservation['Instances']:
-                instance_id = instance.get('InstanceId', 'N/A')
-                ami_id = instance.get('ImageId', 'N/A')
-                name = next((tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Name'), 'Unnamed')
+        response = ec2_client.describe_images(Owners=["self"])
+        images = response.get("Images", [])
 
-                logger.info(f"Instance ID: {instance_id} | Name: {name} | AMI ID: {ami_id}")
-    except Exception as e:
-        logger.error(f"Error auditing AMIs in region {region}: {e}")
+        if not images:
+            ami_logger.info(f"No AMIs found in region: {region}")
+            return
+
+        for image in images:
+            ami_id = image.get("ImageId")
+            name = image.get("Name", "N/A")
+            creation_date = image.get("CreationDate", "N/A")
+            state = image.get("State", "N/A")
+
+            ami_logger.info(f"AMI ID: {ami_id}")
+            ami_logger.info(f"Name: {name}")
+            ami_logger.info(f"State: {state}")
+            ami_logger.info(f"Creation Date: {creation_date}")
+
+            if state != "available":
+                ami_logger.warning(f"AMI {ami_id} is in state '{state}' — investigate if unexpected.")
+
+            ami_logger.info("-" * 60)
+
+    except ClientError as e:
+        ami_logger.error("Error retrieving AMIs in region %s: %s", region, e)
+    except Exception as ex:
+        ami_logger.exception("Unexpected error while auditing AMIs in region %s: %s", region, ex)
