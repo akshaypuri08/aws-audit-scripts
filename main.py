@@ -1,15 +1,15 @@
 from fastapi import FastAPI, Query
 import boto3
 import logging
-from modules import nacl_review, ami_audit
+from modules.nacl_review import audit_nacls
+from modules.ami_audit import audit_amis
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+# FastAPI app
+app = FastAPI(
+    title="AWS Audit Tool",
+    version="1.0",
+    description="Audits AWS NACL and AMI configurations across all available regions."
 )
-
-app = FastAPI(title="AWS Audit API")
 
 @app.get("/")
 async def root():
@@ -19,15 +19,15 @@ async def root():
             "GET /nacl?profile=<aws_profile_name>",
             "GET /ami?profile=<aws_profile_name>"
         ],
-        "note": "Ensure AWS CLI profiles are configured properly."
+        "note": "Ensure AWS CLI profiles are configured properly in ~/.aws/credentials."
     }
 
 @app.get("/nacl")
-async def audit_nacl(profile: str = Query(..., description="AWS CLI profile name")):
+def run_nacl_audit(profile: str = Query(..., description="AWS CLI profile name")):
     session = boto3.Session(profile_name=profile)
-    return nacl_review.audit_nacls(session, profile)
+    return audit_nacls(session, profile)
 
 @app.get("/ami")
-async def audit_ami(profile: str = Query(..., description="AWS CLI profile name")):
+def run_ami_audit(profile: str = Query(..., description="AWS CLI profile name")):
     session = boto3.Session(profile_name=profile)
-    return ami_audit.audit_amis(session, profile)
+    return audit_amis(session, profile)

@@ -1,47 +1,55 @@
+import boto3
 import logging
-from botocore.exceptions import ClientError
+import os
+from datetime import datetime
 
-logger = logging.getLogger(__name__)
+# Ensure logs directory exists
+os.makedirs("./logs", exist_ok=True)
+
+# Logger for AMI audits
+logger = logging.getLogger("AMI_Audit")
 logger.setLevel(logging.INFO)
 
-def audit_amis(session, profile):
-    logger.info(f"Starting AMI audit for profile: {profile}")
+# File handler for AMI logs
+ami_log_file = f"./logs/ami_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+file_handler = logging.FileHandler(ami_log_file)
+file_handler.setLevel(logging.INFO)
 
-    ec2_client = session.client("ec2")
-    try:
-        regions_response = ec2_client.describe_regions(AllRegions=True)
-        regions = [
-            region["RegionName"]
-            for region in regions_response["Regions"]
-            if region["OptInStatus"] != "not-opted-in"
-        ]
-        logger.info(f"Found {len(regions)} regions to scan")
-    except ClientError as e:
-        logger.error(f"Failed to describe regions: {e}")
-        return {"error": str(e)}
+# Console handler
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+
+# Formatter
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# Add handlers
+if not logger.hasHandlers():
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+
+def audit_amis(session, profile):
+    logger.info(f"Using AWS profile: {profile}")
+
+    sts = session.client("sts")
+    identity = sts.get_caller_identity()
+    logger.info(f"Connected as: {identity['Arn']} (Account: {identity['Account']})")
+
+    ec2 = session.client("ec2")
+    regions = [r["RegionName"] for r in ec2.describe_regions()["Regions"]]
 
     report = {}
     for region in regions:
-        logger.info(f"Auditing AMIs in region: {region}")
-        regional_client = session.client("ec2", region_name=region)
-        try:
-            amis_response = regional_client.describe_images(Owners=["self"])
-            amis = amis_response.get("Images", [])
-            logger.info(f"Found {len(amis)} AMIs in {region}")
+        logger.info(f"Target AWS region: {region}")
+        ec2_region = session.client("ec2", region_name=region)
+        amis = ec2_region.describe_images(Owners=["self"])["Images"]
+        logger.info(f"Retrieved {len(amis)} AMI(s) from region '{region}'")
 
-            region_report = []
-            for ami in amis:
-                region_report.append({
-                    "ImageId": ami.get("ImageId"),
-                    "Name": ami.get("Name"),
-                    "CreationDate": ami.get("CreationDate"),
-                    "State": ami.get("State"),
-                    "Public": ami.get("Public")
-                })
-            report[region] = region_report
-        except ClientError as e:
-            logger.error(f"Error fetching AMIs for {region}: {e}")
-            report[region] = {"error": str(e)}
+        for ami in amis:
+            logger.info(f"AMI ID: {ami['ImageId']} | Name: {ami.get('Name', 'N/A')} | Creation Date: {ami['CreationDate']}")
 
-    logger.info(f"AMI audit completed for profile: {profile}")
+        report[region] = amis
+
     return {"profile": profile, "ami_report": report}

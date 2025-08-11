@@ -1,57 +1,62 @@
+import boto3
 import logging
-from botocore.exceptions import ClientError
+import os
+from datetime import datetime
 
-logger = logging.getLogger(__name__)
+# Ensure logs directory exists
+os.makedirs("./logs", exist_ok=True)
+
+# Logger for NACL audits
+logger = logging.getLogger("NACL_Audit")
 logger.setLevel(logging.INFO)
 
-def audit_nacls(session, profile):
-    logger.info(f"Starting NACL audit for profile: {profile}")
+# File handler for NACL logs
+nacl_log_file = f"./logs/nacl_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+file_handler = logging.FileHandler(nacl_log_file)
+file_handler.setLevel(logging.INFO)
 
-    ec2_client = session.client("ec2")
-    try:
-        regions_response = ec2_client.describe_regions(AllRegions=True)
-        regions = [
-            region["RegionName"]
-            for region in regions_response["Regions"]
-            if region["OptInStatus"] != "not-opted-in"
-        ]
-        logger.info(f"Found {len(regions)} regions to scan")
-    except ClientError as e:
-        logger.error(f"Failed to describe regions: {e}")
-        return {"error": str(e)}
+# Console handler
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+
+# Formatter
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# Add handlers
+if not logger.hasHandlers():
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+
+def audit_nacls(session, profile):
+    logger.info(f"Using AWS profile: {profile}")
+
+    sts = session.client("sts")
+    identity = sts.get_caller_identity()
+    logger.info(f"Connected as: {identity['Arn']} (Account: {identity['Account']})")
+
+    ec2 = session.client("ec2")
+    regions = [r["RegionName"] for r in ec2.describe_regions()["Regions"]]
 
     report = {}
     for region in regions:
-        logger.info(f"Auditing NACLs in region: {region}")
-        regional_client = session.client("ec2", region_name=region)
-        try:
-            nacls_response = regional_client.describe_network_acls()
-            nacls = nacls_response.get("NetworkAcls", [])
-            logger.info(f"Found {len(nacls)} NACLs in {region}")
+        logger.info(f"Target AWS region: {region}")
+        ec2_region = session.client("ec2", region_name=region)
+        nacls = ec2_region.describe_network_acls()["NetworkAcls"]
+        logger.info(f"Retrieved {len(nacls)} NACL(s) from region '{region}'")
 
-            region_report = []
-            for nacl in nacls:
-                nacl_info = {
-                    "NetworkAclId": nacl.get("NetworkAclId"),
-                    "VpcId": nacl.get("VpcId"),
-                    "IsDefault": nacl.get("IsDefault"),
-                    "Entries": []
-                }
-                for entry in nacl.get("Entries", []):
-                    nacl_info["Entries"].append({
-                        "RuleNumber": entry.get("RuleNumber"),
-                        "Protocol": entry.get("Protocol"),
-                        "RuleAction": entry.get("RuleAction"),
-                        "Egress": entry.get("Egress"),
-                        "CidrBlock": entry.get("CidrBlock"),
-                        "Ipv6CidrBlock": entry.get("Ipv6CidrBlock", None),
-                        "PortRange": entry.get("PortRange", None)
-                    })
-                region_report.append(nacl_info)
-            report[region] = region_report
-        except ClientError as e:
-            logger.error(f"Error fetching NACLs for {region}: {e}")
-            report[region] = {"error": str(e)}
+        report[region] = []
+        for nacl in nacls:
+            logger.info(f"\n=== NACL ID: {nacl['NetworkAclId']} ===")
+            for entry in nacl["Entries"]:
+                direction = "Outbound" if entry["Egress"] else "Inbound"
+                port_range = "ALL - ALL" if "PortRange" not in entry else f"{entry['PortRange']['From']} - {entry['PortRange']['To']}"
+                cidr = entry.get("CidrBlock") or entry.get("Ipv6CidrBlock", "N/A")
+                logger.info(f"{direction} Rule #{entry['RuleNumber']} | {entry['RuleAction'].upper()} | "
+                            f"Protocol: {entry['Protocol']} | Port: {port_range} | CIDR: {cidr}")
 
-    logger.info(f"NACL audit completed for profile: {profile}")
+            report[region].append(nacl)
+
     return {"profile": profile, "nacl_report": report}
