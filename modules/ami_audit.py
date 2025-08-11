@@ -1,54 +1,57 @@
 import boto3
-import logging
-import os
-
-# Ensure logs directory exists
-os.makedirs("./logs", exist_ok=True)
-
-# Logger for AMI audits
-logger = logging.getLogger("AMI_Audit")
-logger.setLevel(logging.INFO)
-
-# File handler for AMI logs (overwrite mode)
-ami_log_file = "./logs/ami_audit.log"
-file_handler = logging.FileHandler(ami_log_file, mode="w")
-file_handler.setLevel(logging.INFO)
-
-# Console handler
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-
-# Formatter
-formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-file_handler.setFormatter(formatter)
-console_handler.setFormatter(formatter)
-
-# Add handlers if not already present
-if not logger.hasHandlers():
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-
+import botocore
 
 def audit_amis(session, profile):
-    logger.info(f"Using AWS profile: {profile}")
+    ec2_regions = session.get_available_regions("ec2")
+    report = []
 
-    sts = session.client("sts")
-    identity = sts.get_caller_identity()
-    logger.info(f"Connected as: {identity['Arn']} (Account: {identity['Account']})")
+    for region in ec2_regions:
+        ec2 = session.client("ec2", region_name=region)
+        print(f"Checking AMIs in {region}...")
 
-    ec2 = session.client("ec2")
-    regions = [r["RegionName"] for r in ec2.describe_regions()["Regions"]]
+        try:
+            owned_images = ec2.describe_images(Owners=["self"])["Images"]
+        except botocore.exceptions.ClientError as e:
+            if e.response["Error"]["Code"] == "AuthFailure":
+                print(f"Skipping {region} - AuthFailure")
+                continue
+            else:
+                raise
 
-    report = {}
-    for region in regions:
-        logger.info(f"Target AWS region: {region}")
-        ec2_region = session.client("ec2", region_name=region)
-        amis = ec2_region.describe_images(Owners=["self"])["Images"]
-        logger.info(f"Retrieved {len(amis)} AMI(s) from region '{region}'")
+        for ami in owned_images:
+            is_public = ami.get("Public", False)
+            name = ami.get("Name", "Unnamed")
+            ami_id = ami.get("ImageId")
+            state = ami.get("State", "unknown")
 
-        for ami in amis:
-            logger.info(f"AMI ID: {ami['ImageId']} | Name: {ami.get('Name', 'N/A')} | Creation Date: {ami['CreationDate']}")
+            # Check usage
+            used = False
+            try:
+                reservations = ec2.describe_instances(
+                    Filters=[{"Name": "image-id", "Values": [ami_id]}]
+                )["Reservations"]
+                if reservations:
+                    used = True
+            except botocore.exceptions.ClientError:
+                pass  # Skip usage check if not allowed
 
-        report[region] = amis
+            # Add comment
+            if not used and is_public:
+                comment = "Public and unused"
+            elif not used:
+                comment = "Private and unused"
+            elif is_public:
+                comment = "Public and in use"
+            else:
+                comment = "Private and in use"
 
-    return {"profile": profile, "ami_report": report}
+            report.append({
+                "Region": region,
+                "AMI Name": name,
+                "AMI ID": ami_id,
+                "Public": is_public,
+                "Used": used,
+                "Comment": comment
+            })
+
+    return report
