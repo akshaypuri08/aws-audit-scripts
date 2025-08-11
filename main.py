@@ -1,10 +1,8 @@
 from fastapi import FastAPI, Query
 import boto3
-import logging
 from modules.nacl_review import audit_nacls
 from modules.ami_audit import audit_amis
 
-# FastAPI app
 app = FastAPI(
     title="AWS Audit Tool",
     version="1.0",

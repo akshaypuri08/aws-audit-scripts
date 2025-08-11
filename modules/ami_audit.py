@@ -1,7 +1,6 @@
 import boto3
 import logging
 import os
-from datetime import datetime
 
 # Ensure logs directory exists
 os.makedirs("./logs", exist_ok=True)
@@ -10,9 +9,9 @@ os.makedirs("./logs", exist_ok=True)
 logger = logging.getLogger("AMI_Audit")
 logger.setLevel(logging.INFO)
 
-# File handler for AMI logs
-ami_log_file = f"./logs/ami_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-file_handler = logging.FileHandler(ami_log_file)
+# File handler for AMI logs (overwrite mode)
+ami_log_file = "./logs/ami_audit.log"
+file_handler = logging.FileHandler(ami_log_file, mode="w")
 file_handler.setLevel(logging.INFO)
 
 # Console handler
@@ -24,7 +23,7 @@ formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 file_handler.setFormatter(formatter)
 console_handler.setFormatter(formatter)
 
-# Add handlers
+# Add handlers if not already present
 if not logger.hasHandlers():
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
