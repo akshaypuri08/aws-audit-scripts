@@ -1,33 +1,33 @@
 from fastapi import FastAPI, Query
 import boto3
-from modules.nacl_review import review_nacls
-from modules.ami_audit import audit_amis
+import logging
+from modules import nacl_review, ami_audit
 
-app = FastAPI()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 
-def get_session(profile_name: str):
-    return boto3.Session(profile_name=profile_name)
+app = FastAPI(title="AWS Audit API")
 
-def get_all_regions(session):
-    ec2 = session.client("ec2", region_name="us-east-1")
-    response = ec2.describe_regions(AllRegions=False)
-    return [r['RegionName'] for r in response['Regions']]
+@app.get("/")
+async def root():
+    return {
+        "message": "Welcome to the AWS Audit API",
+        "usage_examples": [
+            "GET /nacl?profile=<aws_profile_name>",
+            "GET /ami?profile=<aws_profile_name>"
+        ],
+        "note": "Ensure AWS CLI profiles are configured properly."
+    }
 
 @app.get("/nacl")
-def run_nacl(profile: str = Query(..., description="AWS profile name")):
-    session = get_session(profile)
-    logging.info(f"========= Starting NACL scan for profile: {profile} =========")
-    for region in get_all_regions(session):
-        review_nacls(session, region)
-    logging.info(f"========= Completed NACL scan for profile: {profile} =========")
-    return {"status": "NACL audit completed"}
-
+async def audit_nacl(profile: str = Query(..., description="AWS CLI profile name")):
+    session = boto3.Session(profile_name=profile)
+    return nacl_review.audit_nacls(session, profile)
 
 @app.get("/ami")
-def run_ami(profile: str = Query(..., description="AWS profile name")):
-    session = get_session(profile)
-    logging.info(f"========= Starting AMI scan for profile: {profile} =========")
-    for region in get_all_regions(session):
-        audit_amis(session, region)
-    logging.info(f"========= Completed AMI scan for profile: {profile} =========")
-    return {"status": "AMI audit completed"}
+async def audit_ami(profile: str = Query(..., description="AWS CLI profile name")):
+    session = boto3.Session(profile_name=profile)
+    return ami_audit.audit_amis(session, profile)
