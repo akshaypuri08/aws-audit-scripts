@@ -61,4 +61,27 @@ async def sg_audit_all_ports(profile: str = Query(..., description="AWS CLI prof
     return {
         "message": f"Security Group audit complete. {report['rows_found']} records found.",
         "csv_file": report["csv_report"]
+
+        
     }
+
+@app.get("/sg2")
+async def sg_audit_all_ports(profile: str = Query(..., description="AWS CLI profile name")):
+    print(f"[DEBUG] Received request to run SG audit for profile: {profile}")  # Console log
+
+    session = boto3.Session(profile_name=profile)
+    logger.info(f"Running Security Group all-ports audit for profile: {profile}")
+
+    print("[DEBUG] Starting SG audit function...")  # Console log
+    report = audit_security_groups_all_ports(session, profile)
+    print("[DEBUG] SG audit function completed.")  # Console log
+
+    logger.info(f"Security Group all-ports audit complete. CSV saved to {report['csv_report']}")
+    print(f"[DEBUG] CSV file saved at: {report['csv_report']}")  # Console log
+    print(f"[DEBUG] Total records found: {report['rows_found']}")  # Console log
+
+    return {
+        "message": f"Security Group audit complete. {report['rows_found']} records found.",
+        "csv_file": report["csv_report"]
+    }
+

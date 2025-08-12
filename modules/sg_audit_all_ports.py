@@ -25,10 +25,22 @@ formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 file_handler.setFormatter(formatter)
 console_handler.setFormatter(formatter)
 
-# Add handlers if not already present
 if not logger.hasHandlers():
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
+
+
+def get_devsecops_comment(cidr, port_range):
+    """Return security comment based on CIDR and port range."""
+    if cidr == "0.0.0.0/0" or cidr == "::/0":
+        if port_range in ["22", "3389"]:
+            return "High risk: Admin port open to the world"
+        elif port_range == "ALL":
+            return "All ports open to the world — critical risk"
+        else:
+            return "Open to the world — review necessity"
+    else:
+        return "Restricted access — verify if justified"
 
 
 def audit_security_groups_all_ports(session, profile):
@@ -73,28 +85,36 @@ def audit_security_groups_all_ports(session, profile):
                 else:
                     port_range = f"{from_port}-{to_port}"
 
-                # Check IPv4 ranges
+                # IPv4 rules
                 for ip_range in perm.get("IpRanges", []):
                     cidr = ip_range.get("CidrIp")
                     if cidr:
-                        logger.info(f"Inbound | Protocol: {ip_protocol} | Ports: {port_range} | IPv4 CIDR: {cidr}")
-                        report_rows.append([region, sg["GroupId"], sg.get("GroupName", "Unnamed"),
-                                            ip_protocol, port_range, cidr, "IPv4"])
+                        comment = get_devsecops_comment(cidr, port_range)
+                        logger.info(f"Inbound | Protocol: {ip_protocol} | Ports: {port_range} | IPv4 CIDR: {cidr} | {comment}")
+                        report_rows.append([
+                            region, sg["GroupId"], sg.get("GroupName", "Unnamed"),
+                            ip_protocol, port_range, cidr, "IPv4", comment
+                        ])
 
-                # Check IPv6 ranges
+                # IPv6 rules
                 for ip_range in perm.get("Ipv6Ranges", []):
                     cidr = ip_range.get("CidrIpv6")
                     if cidr:
-                        logger.info(f"Inbound | Protocol: {ip_protocol} | Ports: {port_range} | IPv6 CIDR: {cidr}")
-                        report_rows.append([region, sg["GroupId"], sg.get("GroupName", "Unnamed"),
-                                            ip_protocol, port_range, cidr, "IPv6"])
+                        comment = get_devsecops_comment(cidr, port_range)
+                        logger.info(f"Inbound | Protocol: {ip_protocol} | Ports: {port_range} | IPv6 CIDR: {cidr} | {comment}")
+                        report_rows.append([
+                            region, sg["GroupId"], sg.get("GroupName", "Unnamed"),
+                            ip_protocol, port_range, cidr, "IPv6", comment
+                        ])
 
     # Save CSV
     csv_file = "./logs/sg_audit_all_ports.csv"
     with open(csv_file, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["Region", "SecurityGroupId", "SecurityGroupName",
-                         "Protocol", "PortRange", "CIDR", "IP_Version"])
+        writer.writerow([
+            "Region", "SecurityGroupId", "SecurityGroupName",
+            "Protocol", "PortRange", "CIDR", "IP_Version", "Comment"
+        ])
         writer.writerows(report_rows)
 
     logger.info(f"CSV report saved to {csv_file}")
