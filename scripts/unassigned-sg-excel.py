@@ -9,12 +9,10 @@ PROFILE_NAME = "aqcn"
 OUTPUT_XLSX = "unused_security_groups.xlsx"
 # -----------------------------------------------
 
-# Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger()
 
 def get_all_regions(session):
-    """Fetch all AWS regions."""
     try:
         ec2_client = session.client("ec2", region_name="us-east-1")
         regions = [
@@ -29,7 +27,6 @@ def get_all_regions(session):
         return []
 
 def get_unused_security_groups(session, region):
-    """Get all unused security groups in the region."""
     try:
         ec2 = session.client("ec2", region_name=region)
         
@@ -78,6 +75,23 @@ def get_unused_security_groups(session, region):
         logger.error(f"[{region}] Unexpected error: {e}")
         return []
 
+def merge_identical_cells(ws, col_index):
+    """
+    Merge consecutive identical cells in a given column index (1-based).
+    """
+    start_row = 2  # skip header
+    current_value = ws.cell(row=start_row, column=col_index).value
+    for row in range(start_row + 1, ws.max_row + 1):
+        cell_value = ws.cell(row=row, column=col_index).value
+        if cell_value != current_value:
+            if row - start_row > 1:  # merge if more than 1 row
+                ws.merge_cells(start_row=start_row, start_column=col_index, end_row=row - 1, end_column=col_index)
+            start_row = row
+            current_value = cell_value
+    # Merge last block
+    if ws.max_row - start_row >= 1:
+        ws.merge_cells(start_row=start_row, start_column=col_index, end_row=ws.max_row, end_column=col_index)
+
 def main():
     try:
         base_session = boto3.Session(profile_name=PROFILE_NAME)
@@ -88,7 +102,6 @@ def main():
             logger.info(f"Processing region: {region}")
             all_results.extend(get_unused_security_groups(base_session, region))
         
-        # Create Excel file
         wb = Workbook()
         ws = wb.active
         ws.title = "Unused Security Groups"
@@ -96,21 +109,22 @@ def main():
         headers = ["Region", "SecurityGroupId", "SecurityGroupName", "Protocol", "PortRange", "CIDR", "IP_Version", "Comment"]
         ws.append(headers)
         
-        # Make headers bold
         for cell in ws[1]:
             cell.font = Font(bold=True)
         
-        # Add data rows
         for row in all_results:
             ws.append(row)
         
-        # Auto column width
         for col in ws.columns:
             max_length = max(len(str(cell.value)) if cell.value else 0 for cell in col)
             ws.column_dimensions[col[0].column_letter].width = max_length + 2
         
+        # Merge only these columns: Region(1), SecurityGroupId(2), SecurityGroupName(3), Protocol(4)
+        for col_index in [1, 2, 3, 4]:
+            merge_identical_cells(ws, col_index)
+        
         wb.save(OUTPUT_XLSX)
-        logger.info(f"Excel file generated: {OUTPUT_XLSX}")
+        logger.info(f"Excel file generated with merged cells for specific columns: {OUTPUT_XLSX}")
     
     except NoCredentialsError:
         logger.error("AWS credentials not found. Check your profile and config.")
