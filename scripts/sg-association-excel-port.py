@@ -8,9 +8,9 @@ from botocore.exceptions import ClientError
 # -------------------------
 # CONFIG
 # -------------------------
-AWS_PROFILE = "your-cli-profile"   # Change this
+AWS_PROFILE = "aqcn"   # Change this
 TARGET_PORTS = {20, 21, 22, 3389, 5432}
-INBOUND_FILE = "sg_inbound_rules.xlsx"
+INBOUND_FILE = "621924646669_security_groups_in_use.xlsx"
 OUTBOUND_FILE = "sg_outbound_rules.xlsx"
 # -------------------------
 
