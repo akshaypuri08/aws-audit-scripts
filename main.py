@@ -64,24 +64,18 @@ async def sg_audit_all_ports(profile: str = Query(..., description="AWS CLI prof
 
         
     }
-
-@app.get("/sg2")
-async def sg_audit_all_ports(profile: str = Query(..., description="AWS CLI profile name")):
-    print(f"[DEBUG] Received request to run SG audit for profile: {profile}")  # Console log
-
+@app.get("/sgport")
+async def sg_audit_selected_ports(profile: str = Query(..., description="AWS CLI profile name")):
     session = boto3.Session(profile_name=profile)
-    logger.info(f"Running Security Group all-ports audit for profile: {profile}")
-
-    print("[DEBUG] Starting SG audit function...")  # Console log
-    report = audit_security_groups_all_ports(session, profile)
-    print("[DEBUG] SG audit function completed.")  # Console log
-
-    logger.info(f"Security Group all-ports audit complete. CSV saved to {report['csv_report']}")
-    print(f"[DEBUG] CSV file saved at: {report['csv_report']}")  # Console log
-    print(f"[DEBUG] Total records found: {report['rows_found']}")  # Console log
-
+    logger.info(f"Running Security Group selected-ports audit for profile: {profile}")
+    report = audit_security_groups_selected_ports(session, profile)
+    if report.get("csv_report"):
+        logger.info(f"Selected-ports audit complete. CSV saved to {report['csv_report']}")
+    else:
+        logger.error(f"Selected-ports audit failed: {report.get('error')}")
     return {
-        "message": f"Security Group audit complete. {report['rows_found']} records found.",
-        "csv_file": report["csv_report"]
+        "message": f"Security Group selected-port audit complete. {report.get('rows_found',0)} records found.",
+        "csv_file": report.get("csv_report"),
+        "error": report.get("error")
     }
 
