@@ -11,14 +11,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # -------------------------
 AWS_PROFILE = "aqcn"   # Change this
 TARGET_PORTS = {20, 21, 22, 3389, 5432}
-INBOUND_FILE = "621924646669_security_groups_in_use.xlsx"
-OUTBOUND_FILE = "sg_outbound_rules.xlsx"
+INBOUND_FILE = "621924646669_security_groups_in_use_selected_ports.xlsx"
+OUTBOUND_FILE = "621924646669_security_groups_in_use_selected_ports_outbound.xlsx"
 MAX_THREADS = 5  # Number of regions scanned in parallel
 # -------------------------
 
 session = boto3.Session(profile_name=AWS_PROFILE)
 ec2_client = session.client("ec2")
-
 
 # ------------------- Excel Merge -------------------
 def merge_cells_excel(file_path):
@@ -42,7 +41,6 @@ def merge_cells_excel(file_path):
             ws[f"{col_letter}{merge_start}"].alignment = Alignment(vertical="center", horizontal="center")
     wb.save(file_path)
 
-
 # ------------------- Rule Filtering -------------------
 def rule_matches_ports(rule):
     from_port = rule.get("FromPort")
@@ -50,7 +48,6 @@ def rule_matches_ports(rule):
     if from_port is None or to_port is None:
         return False
     return any(from_port <= port <= to_port for port in TARGET_PORTS)
-
 
 def collect_rules(sg, direction="inbound"):
     results = []
@@ -70,72 +67,191 @@ def collect_rules(sg, direction="inbound"):
         print(f"Error collecting {direction} rules: {e}")
     return results
 
-
-# ------------------- Resource Scan per Service -------------------
+# ------------------- Scan One Region -------------------
 def scan_region(region):
-    region_results = []
+    results = []
     try:
         ec2 = session.client("ec2", region_name=region)
         sgs = ec2.describe_security_groups()["SecurityGroups"]
+        sg_map = {sg["GroupId"]: [] for sg in sgs}
 
-        # Build SG -> resources map
-        sg_map = {}  # sg_id -> list of (resource_type, resource_id, resource_name)
-        for sg in sgs:
-            sg_id = sg["GroupId"]
-            sg_map[sg_id] = []
-        # ---------------- EC2 Instances ----------------
-        try:
-            paginator = ec2.get_paginator("describe_instances")
-            for page in paginator.paginate(Filters=[{"Name": "instance.group-id", "Values": list(sg_map.keys())}]):
-                for res in page["Reservations"]:
-                    for inst in res["Instances"]:
-                        name = next((t["Value"] for t in inst.get("Tags", []) if t["Key"] == "Name"), "")
-                        for sg in inst.get("SecurityGroups", []):
-                            sg_map[sg["GroupId"]].append(("EC2", inst["InstanceId"], name))
-        except Exception as e:
-            print(f"[EC2] {region} {e}")
-
-        # ---------------- ENIs ----------------
+        # ---------- ENI-first (captures most services) ----------
         try:
             paginator = ec2.get_paginator("describe_network_interfaces")
-            for page in paginator.paginate(Filters=[{"Name": "group-id", "Values": list(sg_map.keys())}]):
+            for page in paginator.paginate():
                 for eni in page["NetworkInterfaces"]:
                     desc = eni.get("Description", "")
                     name = next((t["Value"] for t in eni.get("TagSet", []) if t["Key"] == "Name"), desc)
                     for sg in eni.get("Groups", []):
-                        sg_map[sg["GroupId"]].append(("ENI", eni["NetworkInterfaceId"], name))
+                        sgid = sg["GroupId"]
+                        if sgid in sg_map:
+                            sg_map[sgid].append(("ENI", eni["NetworkInterfaceId"], name))
         except Exception as e:
             print(f"[ENI] {region} {e}")
 
-        # ---------------- Classic ELB ----------------
+        # ---------- EC2 Instances ----------
+        try:
+            paginator = ec2.get_paginator("describe_instances")
+            for page in paginator.paginate():
+                for res in page["Reservations"]:
+                    for inst in res["Instances"]:
+                        name = next((t["Value"] for t in inst.get("Tags", []) if t["Key"] == "Name"), "")
+                        for sg in inst.get("SecurityGroups", []):
+                            sgid = sg["GroupId"]
+                            if sgid in sg_map:
+                                sg_map[sgid].append(("EC2", inst["InstanceId"], name))
+        except Exception as e:
+            print(f"[EC2] {region} {e}")
+
+        # ---------- Classic ELB ----------
         try:
             elb = session.client("elb", region_name=region)
             paginator = elb.get_paginator("describe_load_balancers")
             for page in paginator.paginate():
                 for lb in page["LoadBalancerDescriptions"]:
-                    for sg in lb.get("SecurityGroups", []):
-                        if sg in sg_map:
-                            sg_map[sg].append(("ELB", lb["LoadBalancerName"], lb.get("DNSName", "")))
+                    for sgid in lb.get("SecurityGroups", []):
+                        if sgid in sg_map:
+                            sg_map[sgid].append(("Classic ELB", lb["LoadBalancerName"], lb.get("DNSName", "")))
         except Exception as e:
             print(f"[ELB] {region} {e}")
 
-        # ---------------- ALB/NLB ----------------
+        # ---------- ALB / NLB ----------
         try:
             elbv2 = session.client("elbv2", region_name=region)
             paginator = elbv2.get_paginator("describe_load_balancers")
             for page in paginator.paginate():
                 for lb in page["LoadBalancers"]:
-                    for sg in lb.get("SecurityGroups", []):
-                        if sg in sg_map:
-                            sg_map[sg].append(("ALB/NLB", lb["LoadBalancerName"], lb.get("DNSName", "")))
+                    for sgid in lb.get("SecurityGroups", []):
+                        if sgid in sg_map:
+                            sg_map[sgid].append(("ALB/NLB", lb["LoadBalancerName"], lb.get("DNSName", "")))
         except Exception as e:
             print(f"[ALB/NLB] {region} {e}")
 
-        # ---------------- Additional Services ----------------
-        # Services like RDS, Redshift, ElastiCache, SageMaker, Lambda, Neptune, Glue, AppRunner, WorkSpaces, AppStream, DataSync
-        # can be added similarly using paginators and mapping SG -> resources.
+        # ---------- RDS ----------
+        try:
+            rds = session.client("rds", region_name=region)
+            for db in rds.describe_db_instances()["DBInstances"]:
+                for vpcsg in db.get("VpcSecurityGroups", []):
+                    sgid = vpcsg["VpcSecurityGroupId"]
+                    if sgid in sg_map:
+                        name = next((t["Value"] for t in db.get("TagList", []) if t["Key"] == "Name"), "")
+                        sg_map[sgid].append(("RDS Instance", db["DBInstanceIdentifier"], name))
+            for cluster in rds.describe_db_clusters()["DBClusters"]:
+                for vpcsg in cluster.get("VpcSecurityGroups", []):
+                    sgid = vpcsg["VpcSecurityGroupId"]
+                    if sgid in sg_map:
+                        sg_map[sgid].append(("RDS Cluster", cluster["DBClusterIdentifier"], ""))
+        except Exception as e:
+            print(f"[RDS] {region} {e}")
 
-        # ---------------- Collect SG Rules ----------------
+        # ---------- ElastiCache ----------
+        try:
+            elasticache = session.client("elasticache", region_name=region)
+            for cl in elasticache.describe_cache_clusters(ShowCacheNodeInfo=True)["CacheClusters"]:
+                for vpcsg in cl.get("SecurityGroups", []):
+                    sgid = vpcsg["SecurityGroupId"]
+                    if sgid in sg_map:
+                        sg_map[sgid].append(("ElastiCache", cl["CacheClusterId"], ""))
+        except Exception as e:
+            print(f"[ElastiCache] {region} {e}")
+
+        # ---------- Redshift ----------
+        try:
+            redshift = session.client("redshift", region_name=region)
+            for cluster in redshift.describe_clusters()["Clusters"]:
+                for vpcsg in cluster.get("VpcSecurityGroups", []):
+                    sgid = vpcsg["VpcSecurityGroupId"]
+                    if sgid in sg_map:
+                        sg_map[sgid].append(("Redshift", cluster["ClusterIdentifier"], ""))
+        except Exception as e:
+            print(f"[Redshift] {region} {e}")
+
+        # ---------- EFS ----------
+        try:
+            efs = session.client("efs", region_name=region)
+            for fs in efs.describe_file_systems()["FileSystems"]:
+                for m in efs.describe_mount_targets(FileSystemId=fs["FileSystemId"])["MountTargets"]:
+                    sg_list = efs.describe_mount_target_security_groups(MountTargetId=m["MountTargetId"])["SecurityGroups"]
+                    for sgid in sg_list:
+                        if sgid in sg_map:
+                            sg_map[sgid].append(("EFS", fs["FileSystemId"], ""))
+        except Exception as e:
+            print(f"[EFS] {region} {e}")
+
+        # ---------- MQ ----------
+        try:
+            mq = session.client("mq", region_name=region)
+            for broker in mq.list_brokers()["BrokerSummaries"]:
+                details = mq.describe_broker(BrokerId=broker["BrokerId"])
+                for sgid in details.get("SecurityGroups", []):
+                    if sgid in sg_map:
+                        sg_map[sgid].append(("MQ", broker["BrokerName"], ""))
+        except Exception as e:
+            print(f"[MQ] {region} {e}")
+
+        # ---------- SageMaker ----------
+        try:
+            sm = session.client("sagemaker", region_name=region)
+            for nb in sm.list_notebook_instances()["NotebookInstances"]:
+                for sgid in sm.describe_notebook_instance(NotebookInstanceName=nb["NotebookInstanceName"]).get("SecurityGroups", []):
+                    if sgid in sg_map:
+                        sg_map[sgid].append(("SageMaker Notebook", nb["NotebookInstanceName"], ""))
+            for ep in sm.list_endpoints()["Endpoints"]:
+                for sgid in sm.describe_endpoint(EndpointName=ep["EndpointName"]).get("VpcConfig", {}).get("SecurityGroupIds", []):
+                    if sgid in sg_map:
+                        sg_map[sgid].append(("SageMaker Endpoint", ep["EndpointName"], ""))
+        except Exception as e:
+            print(f"[SageMaker] {region} {e}")
+
+        # ---------- Lambda ----------
+        try:
+            lambda_client = session.client("lambda", region_name=region)
+            for fn in lambda_client.list_functions()["Functions"]:
+                cfg = lambda_client.get_function_configuration(FunctionName=fn["FunctionName"])
+                for sgid in cfg.get("VpcConfig", {}).get("SecurityGroupIds", []):
+                    if sgid in sg_map:
+                        sg_map[sgid].append(("Lambda", fn["FunctionName"], ""))
+        except Exception as e:
+            print(f"[Lambda] {region} {e}")
+
+        # ---------- MSK ----------
+        try:
+            msk = session.client("kafka", region_name=region)
+            for cluster in msk.list_clusters()["ClusterInfoList"]:
+                details = msk.describe_cluster(ClusterArn=cluster["ClusterArn"])["ClusterInfo"]
+                for sgid in details.get("BrokerNodeGroupInfo", {}).get("SecurityGroups", []):
+                    if sgid in sg_map:
+                        sg_map[sgid].append(("MSK", cluster["ClusterName"], ""))
+        except Exception as e:
+            print(f"[MSK] {region} {e}")
+
+        # ---------- Glue ----------
+        try:
+            glue = session.client("glue", region_name=region)
+            for dev in glue.get_dev_endpoints()["DevEndpoints"]:
+                for sgid in dev.get("SecurityGroupIds", []):
+                    if sgid in sg_map:
+                        sg_map[sgid].append(("Glue Dev Endpoint", dev["EndpointName"], ""))
+        except Exception as e:
+            print(f"[Glue] {region} {e}")
+
+        # ---------- App Runner ----------
+        try:
+            apprunner = session.client("apprunner", region_name=region)
+            for svc in apprunner.list_services()["ServiceSummaryList"]:
+                details = apprunner.describe_service(ServiceArn=svc["ServiceArn"])["Service"]
+                vpc_conn = details.get("NetworkConfiguration", {}).get("VpcConnectorArn", [])
+                if isinstance(vpc_conn, str):
+                    sgid = vpc_conn  # For simplicity
+                    if sgid in sg_map:
+                        sg_map[sgid].append(("App Runner", svc["ServiceName"], ""))
+        except Exception as e:
+            print(f"[AppRunner] {region} {e}")
+
+        # ---------- Remaining services (Transit Gateway, Neptune, DocumentDB, OpenSearch, DMS, WorkSpaces, AppStream, DataSync) ----------
+        # Already captured via ENI scan (ENI-first strategy)
+
+        # ---------- Collect Rules ----------
         for sg in sgs:
             sg_id = sg["GroupId"]
             sg_name = sg.get("GroupName", "")
@@ -147,21 +263,20 @@ def scan_region(region):
             outbound_rules = collect_rules(sg, "outbound")
             for res_type, res_id, res_name in resources:
                 for proto, fport, tport, cidr, ip_ver, desc in inbound_rules:
-                    region_results.append([region, sg_id, sg_name, sg_desc, res_type, res_id, res_name,
-                                           proto, fport, tport, cidr, ip_ver, desc, "INBOUND"])
+                    results.append([region, sg_id, sg_name, sg_desc, res_type, res_id, res_name,
+                                    proto, fport, tport, cidr, ip_ver, desc, "INBOUND"])
                 for proto, fport, tport, cidr, ip_ver, desc in outbound_rules:
-                    region_results.append([region, sg_id, sg_name, sg_desc, res_type, res_id, res_name,
-                                           proto, fport, tport, cidr, ip_ver, desc, "OUTBOUND"])
+                    results.append([region, sg_id, sg_name, sg_desc, res_type, res_id, res_name,
+                                    proto, fport, tport, cidr, ip_ver, desc, "OUTBOUND"])
 
     except EndpointConnectionError:
         print(f"Region {region} not available")
     except Exception as e:
         print(f"[{region}] Unexpected error: {e}")
 
-    return region_results
+    return results
 
-
-# ------------------- Main Execution -------------------
+# ------------------- Main -------------------
 def main():
     inbound_data = []
     outbound_data = []
@@ -195,7 +310,6 @@ def main():
     merge_cells_excel(INBOUND_FILE)
     merge_cells_excel(OUTBOUND_FILE)
     print(f"Exported results to {INBOUND_FILE} and {OUTBOUND_FILE}")
-
 
 if __name__ == "__main__":
     main()

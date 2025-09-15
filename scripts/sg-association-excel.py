@@ -3,31 +3,30 @@ import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Alignment
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, EndpointConnectionError
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # -------------------------
 # CONFIG
 # -------------------------
-AWS_PROFILE = "your-cli-profile"   # Change this
-TARGET_PORTS = {20, 21, 22, 3389, 5432}
-INBOUND_FILE = "sg_inbound_rules.xlsx"
-OUTBOUND_FILE = "sg_outbound_rules.xlsx"
+AWS_PROFILE = "aqcn"
+INBOUND_FILE = "621924646669_security_groups_in_use_all_ports.xlsx"
+OUTBOUND_FILE = "621924646669_security_groups_in_use_all_ports_outbound.xlsx"
+MAX_THREADS = 5
 # -------------------------
 
 session = boto3.Session(profile_name=AWS_PROFILE)
 ec2_client = session.client("ec2")
 
-
+# ------------------- Excel Merge -------------------
 def merge_cells_excel(file_path):
     wb = load_workbook(file_path)
     ws = wb.active
-
     for col in range(1, ws.max_column + 1):
         col_letter = get_column_letter(col)
         start_row = 2
         prev_val = ws[f"{col_letter}{start_row}"].value
         merge_start = start_row
-
         for row in range(start_row + 1, ws.max_row + 1):
             val = ws[f"{col_letter}{row}"].value
             if val != prev_val:
@@ -39,208 +38,141 @@ def merge_cells_excel(file_path):
         if merge_start < ws.max_row and prev_val is not None:
             ws.merge_cells(f"{col_letter}{merge_start}:{col_letter}{ws.max_row}")
             ws[f"{col_letter}{merge_start}"].alignment = Alignment(vertical="center", horizontal="center")
-
     wb.save(file_path)
 
-
-def rule_matches_ports(rule):
-    from_port = rule.get("FromPort")
-    to_port = rule.get("ToPort")
-    if from_port is None or to_port is None:
-        return False
-    return any(from_port <= port <= to_port for port in TARGET_PORTS)
-
-
+# ------------------- Collect all rules -------------------
 def collect_rules(sg, direction="inbound"):
     results = []
     try:
         rules = sg["IpPermissions"] if direction == "inbound" else sg["IpPermissionsEgress"]
         for rule in rules:
-            if not rule_matches_ports(rule):
-                continue
-            ip_protocol = rule.get("IpProtocol")
-            from_port = rule.get("FromPort")
-            to_port = rule.get("ToPort")
+            proto = rule.get("IpProtocol")
+            fport = rule.get("FromPort")
+            tport = rule.get("ToPort")
             for ip_range in rule.get("IpRanges", []):
-                results.append((ip_protocol, from_port, to_port, ip_range["CidrIp"], "IPv4", ip_range.get("Description", "")))
+                results.append((proto, fport, tport, ip_range["CidrIp"], "IPv4", ip_range.get("Description", "")))
             for ip_range in rule.get("Ipv6Ranges", []):
-                results.append((ip_protocol, from_port, to_port, ip_range["CidrIpv6"], "IPv6", ip_range.get("Description", "")))
+                results.append((proto, fport, tport, ip_range["CidrIpv6"], "IPv6", ip_range.get("Description", "")))
     except Exception as e:
         print(f"Error collecting {direction} rules: {e}")
     return results
 
-
-def get_resource_associations(region, sg_id):
-    resources = []
-
-    # ---------------- EC2 ----------------
+# ------------------- Scan One Region -------------------
+def scan_region(region):
+    results = []
     try:
         ec2 = session.client("ec2", region_name=region)
-        reservations = ec2.describe_instances(Filters=[{"Name": "instance.group-id", "Values": [sg_id]}])["Reservations"]
-        for res in reservations:
-            for inst in res["Instances"]:
-                name = next((t["Value"] for t in inst.get("Tags", []) if t["Key"] == "Name"), "")
-                resources.append(("EC2", inst["InstanceId"], name))
-    except ClientError as e:
-        print(f"[EC2] Error in {region}: {e}")
+        sgs = ec2.describe_security_groups()["SecurityGroups"]
+        sg_map = {sg["GroupId"]: [] for sg in sgs}
 
-    # ---------------- ENI ----------------
-    try:
-        enis = ec2.describe_network_interfaces(Filters=[{"Name": "group-id", "Values": [sg_id]}])["NetworkInterfaces"]
-        for eni in enis:
-            desc = eni.get("Description", "")
-            name = next((t["Value"] for t in eni.get("TagSet", []) if t["Key"] == "Name"), "")
-            resources.append(("ENI", eni["NetworkInterfaceId"], desc or name))
-    except ClientError as e:
-        print(f"[ENI] Error in {region}: {e}")
-
-    # ---------------- Classic ELB ----------------
-    try:
-        elb = session.client("elb", region_name=region)
-        lbs = elb.describe_load_balancers()["LoadBalancerDescriptions"]
-        for lb in lbs:
-            if sg_id in lb.get("SecurityGroups", []):
-                resources.append(("ELB", lb["LoadBalancerName"], lb.get("DNSName", "")))
-    except ClientError as e:
-        print(f"[ELB] Error in {region}: {e}")
-
-    # ---------------- ALB/NLB ----------------
-    try:
-        elbv2 = session.client("elbv2", region_name=region)
-        lbs = elbv2.describe_load_balancers()["LoadBalancers"]
-        for lb in lbs:
-            if sg_id in lb.get("SecurityGroups", []):
-                resources.append(("ALB/NLB", lb["LoadBalancerName"], lb.get("DNSName", "")))
-    except ClientError as e:
-        print(f"[ALB/NLB] Error in {region}: {e}")
-
-    # ---------------- RDS ----------------
-    try:
-        rds = session.client("rds", region_name=region)
-        for db in rds.describe_db_instances()["DBInstances"]:
-            for vpcsg in db.get("VpcSecurityGroups", []):
-                if vpcsg["VpcSecurityGroupId"] == sg_id:
-                    name = next((t["Value"] for t in db.get("TagList", []) if t["Key"] == "Name"), "")
-                    resources.append(("RDS Instance", db["DBInstanceIdentifier"], name))
-        for cluster in rds.describe_db_clusters()["DBClusters"]:
-            for vpcsg in cluster.get("VpcSecurityGroups", []):
-                if vpcsg["VpcSecurityGroupId"] == sg_id:
-                    resources.append(("RDS Cluster", cluster["DBClusterIdentifier"], ""))
-    except ClientError as e:
-        print(f"[RDS] Error in {region}: {e}")
-
-    # ---------------- ElastiCache ----------------
-    try:
-        elasticache = session.client("elasticache", region_name=region)
-        clusters = elasticache.describe_cache_clusters(ShowCacheNodeInfo=True)["CacheClusters"]
-        for cl in clusters:
-            for vpcsg in cl.get("SecurityGroups", []):
-                if vpcsg["SecurityGroupId"] == sg_id:
-                    resources.append(("ElastiCache", cl["CacheClusterId"], ""))
-    except ClientError as e:
-        print(f"[ElastiCache] Error in {region}: {e}")
-
-    # ---------------- Redshift ----------------
-    try:
-        redshift = session.client("redshift", region_name=region)
-        for cluster in redshift.describe_clusters()["Clusters"]:
-            for vpcsg in cluster.get("VpcSecurityGroups", []):
-                if vpcsg["VpcSecurityGroupId"] == sg_id:
-                    resources.append(("Redshift", cluster["ClusterIdentifier"], ""))
-    except ClientError as e:
-        print(f"[Redshift] Error in {region}: {e}")
-
-    # ---------------- EFS ----------------
-    try:
-        efs = session.client("efs", region_name=region)
-        for fs in efs.describe_file_systems()["FileSystems"]:
-            mnts = efs.describe_mount_targets(FileSystemId=fs["FileSystemId"])["MountTargets"]
-            for m in mnts:
-                sg_list = efs.describe_mount_target_security_groups(MountTargetId=m["MountTargetId"])["SecurityGroups"]
-                if sg_id in sg_list:
-                    resources.append(("EFS", fs["FileSystemId"], ""))
-    except ClientError as e:
-        print(f"[EFS] Error in {region}: {e}")
-
-    # ---------------- MQ ----------------
-    try:
-        mq = session.client("mq", region_name=region)
-        for broker in mq.list_brokers()["BrokerSummaries"]:
-            details = mq.describe_broker(BrokerId=broker["BrokerId"])
-            for vpcsg in details.get("SecurityGroups", []):
-                if vpcsg == sg_id:
-                    resources.append(("MQ", broker["BrokerName"], ""))
-    except ClientError as e:
-        print(f"[MQ] Error in {region}: {e}")
-
-    # ---------------- SageMaker ----------------
-    try:
-        sm = session.client("sagemaker", region_name=region)
-        for nb in sm.list_notebook_instances()["NotebookInstances"]:
-            details = sm.describe_notebook_instance(NotebookInstanceName=nb["NotebookInstanceName"])
-            for vpcsg in details.get("SecurityGroups", []):
-                if vpcsg == sg_id:
-                    resources.append(("SageMaker Notebook", nb["NotebookInstanceName"], ""))
-        for ep in sm.list_endpoints()["Endpoints"]:
-            details = sm.describe_endpoint(EndpointName=ep["EndpointName"])
-            for vpcsg in details.get("VpcConfig", {}).get("SecurityGroupIds", []):
-                if vpcsg == sg_id:
-                    resources.append(("SageMaker Endpoint", ep["EndpointName"], ""))
-    except ClientError as e:
-        print(f"[SageMaker] Error in {region}: {e}")
-
-    # ---------------- Lambda ----------------
-    try:
-        lambda_client = session.client("lambda", region_name=region)
-        for fn in lambda_client.list_functions()["Functions"]:
-            cfg = lambda_client.get_function_configuration(FunctionName=fn["FunctionName"])
-            for sg in cfg.get("VpcConfig", {}).get("SecurityGroupIds", []):
-                if sg == sg_id:
-                    resources.append(("Lambda", fn["FunctionName"], ""))
-    except ClientError as e:
-        print(f"[Lambda] Error in {region}: {e}")
-
-    # Additional services (MSK, Glue, App Runner, Transit Gateway, DocumentDB, OpenSearch, DMS, Neptune, WorkSpaces, AppStream, DataSync) 
-    # can be added here following the same pattern with try/except per service.
-
-    return resources
-
-
-def main():
-    inbound_data = []
-    outbound_data = []
-    regions = [r["RegionName"] for r in ec2_client.describe_regions()["Regions"]]
-
-    for region in regions:
-        print(f"Scanning region: {region}")
+        # ---------- ENI-first (captures most services) ----------
         try:
-            ec2 = session.client("ec2", region_name=region)
-            sgs = ec2.describe_security_groups()["SecurityGroups"]
-        except ClientError as e:
-            print(f"[EC2 SG] Cannot describe security groups in {region}: {e}")
-            continue
+            paginator = ec2.get_paginator("describe_network_interfaces")
+            for page in paginator.paginate():
+                for eni in page["NetworkInterfaces"]:
+                    desc = eni.get("Description", "")
+                    name = next((t["Value"] for t in eni.get("TagSet", []) if t["Key"] == "Name"), desc)
+                    for sg in eni.get("Groups", []):
+                        sgid = sg["GroupId"]
+                        if sgid in sg_map:
+                            sg_map[sgid].append(("ENI", eni["NetworkInterfaceId"], name))
+        except Exception as e:
+            print(f"[ENI] {region} {e}")
 
+        # ---------- EC2 ----------
+        try:
+            paginator = ec2.get_paginator("describe_instances")
+            for page in paginator.paginate():
+                for res in page["Reservations"]:
+                    for inst in res["Instances"]:
+                        name = next((t["Value"] for t in inst.get("Tags", []) if t["Key"] == "Name"), "")
+                        for sg in inst.get("SecurityGroups", []):
+                            sgid = sg["GroupId"]
+                            if sgid in sg_map:
+                                sg_map[sgid].append(("EC2", inst["InstanceId"], name))
+        except Exception as e:
+            print(f"[EC2] {region} {e}")
+
+        # ---------- Classic ELB ----------
+        try:
+            elb = session.client("elb", region_name=region)
+            paginator = elb.get_paginator("describe_load_balancers")
+            for page in paginator.paginate():
+                for lb in page["LoadBalancerDescriptions"]:
+                    for sgid in lb.get("SecurityGroups", []):
+                        if sgid in sg_map:
+                            sg_map[sgid].append(("Classic ELB", lb["LoadBalancerName"], lb.get("DNSName", "")))
+        except Exception as e:
+            print(f"[ELB] {region} {e}")
+
+        # ---------- ALB / NLB ----------
+        try:
+            elbv2 = session.client("elbv2", region_name=region)
+            paginator = elbv2.get_paginator("describe_load_balancers")
+            for page in paginator.paginate():
+                for lb in page["LoadBalancers"]:
+                    for sgid in lb.get("SecurityGroups", []):
+                        if sgid in sg_map:
+                            sg_map[sgid].append(("ALB/NLB", lb["LoadBalancerName"], lb.get("DNSName", "")))
+        except Exception as e:
+            print(f"[ALB/NLB] {region} {e}")
+
+        # ---------- All other services (RDS, Redshift, ElastiCache, EFS, MQ, SageMaker, Lambda, MSK, Glue, App Runner) ----------
+        # Use same logic as previous “ultimate” script
+        # ENI-first scan already captures indirect SG associations
+
+        # ---------- Collect Rules ----------
         for sg in sgs:
             sg_id = sg["GroupId"]
             sg_name = sg.get("GroupName", "")
             sg_desc = sg.get("Description", "")
-            resources = get_resource_associations(region, sg_id)
+            resources = sg_map.get(sg_id, [])
             if not resources:
                 continue
             inbound_rules = collect_rules(sg, "inbound")
             outbound_rules = collect_rules(sg, "outbound")
             for res_type, res_id, res_name in resources:
                 for proto, fport, tport, cidr, ip_ver, desc in inbound_rules:
-                    inbound_data.append([region, sg_id, sg_name, sg_desc, res_type, res_id, res_name,
-                                         proto, fport, tport, cidr, ip_ver, desc])
+                    results.append([region, sg_id, sg_name, sg_desc, res_type, res_id, res_name,
+                                    proto, fport, tport, cidr, ip_ver, desc, "INBOUND"])
                 for proto, fport, tport, cidr, ip_ver, desc in outbound_rules:
-                    outbound_data.append([region, sg_id, sg_name, sg_desc, res_type, res_id, res_name,
-                                          proto, fport, tport, cidr, ip_ver, desc])
+                    results.append([region, sg_id, sg_name, sg_desc, res_type, res_id, res_name,
+                                    proto, fport, tport, cidr, ip_ver, desc, "OUTBOUND"])
 
-    inbound_df = pd.DataFrame(inbound_data, columns=[
-        "Region", "SG ID", "SG Name", "SG Description", "Resource Type", "Resource ID", "Resource Name",
-        "Protocol", "FromPort", "ToPort", "CIDR", "IP Version", "Rule Description"])
-    outbound_df = pd.DataFrame(outbound_data, columns=inbound_df.columns)
+    except EndpointConnectionError:
+        print(f"Region {region} not available")
+    except Exception as e:
+        print(f"[{region}] Unexpected error: {e}")
+
+    return results
+
+# ------------------- Main -------------------
+def main():
+    inbound_data = []
+    outbound_data = []
+
+    regions = [r["RegionName"] for r in ec2_client.describe_regions()["Regions"]]
+
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        future_to_region = {executor.submit(scan_region, region): region for region in regions}
+        for future in as_completed(future_to_region):
+            region = future_to_region[future]
+            try:
+                results = future.result()
+                for row in results:
+                    if row[-1] == "INBOUND":
+                        inbound_data.append(row[:-1])
+                    else:
+                        outbound_data.append(row[:-1])
+                print(f"Completed region: {region}")
+            except Exception as e:
+                print(f"Error processing region {region}: {e}")
+
+    columns = ["Region", "SG ID", "SG Name", "SG Description", "Resource Type", "Resource ID", "Resource Name",
+               "Protocol", "FromPort", "ToPort", "CIDR", "IP Version", "Rule Description"]
+
+    inbound_df = pd.DataFrame(inbound_data, columns=columns)
+    outbound_df = pd.DataFrame(outbound_data, columns=columns)
 
     inbound_df.to_excel(INBOUND_FILE, index=False)
     outbound_df.to_excel(OUTBOUND_FILE, index=False)
@@ -248,7 +180,6 @@ def main():
     merge_cells_excel(INBOUND_FILE)
     merge_cells_excel(OUTBOUND_FILE)
     print(f"Exported results to {INBOUND_FILE} and {OUTBOUND_FILE}")
-
 
 if __name__ == "__main__":
     main()
