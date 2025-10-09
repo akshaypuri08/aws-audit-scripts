@@ -6,18 +6,12 @@ from openpyxl.styles import Alignment
 from botocore.exceptions import EndpointConnectionError
 from botocore.config import Config
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from openpyxl.utils import get_column_letter
 
-# -------------------------
-# CONFIG
-# -------------------------
 AWS_PROFILE = "aqcn"
-INBOUND_FILE = "621924646669_security_groups_in_use_all_ports.xlsx"
-OUTBOUND_FILE = "621924646669_security_groups_in_use_all_ports_outbound.xlsx"
+INBOUND_FILE = "lb_security_groups_inbound.xlsx"
+OUTBOUND_FILE = "lb_security_groups_outbound.xlsx"
 MAX_THREADS = 5
-# -------------------------
 
-# Configure logging
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO
@@ -27,7 +21,6 @@ session = boto3.Session(profile_name=AWS_PROFILE)
 config = Config(retries={'max_attempts': 5, 'mode': 'adaptive'}, connect_timeout=5, read_timeout=10)
 ec2_client = session.client("ec2", config=config)
 
-# ------------------- Helpers -------------------
 def normalize_protocol(proto):
     if proto is None:
         return ""
@@ -40,7 +33,6 @@ def format_port_range(proto, fport, tport):
     p = normalize_protocol(proto)
     if p == "ALL":
         return "ALL"
-
     lowerp = p.lower()
     if lowerp.startswith("icmp"):
         if fport is None and tport is None:
@@ -50,7 +42,6 @@ def format_port_range(proto, fport, tport):
         if tport is None:
             return str(fport)
         return f"{fport}/{tport}"
-
     if fport is None and tport is None:
         return ""
     if fport == tport:
@@ -65,7 +56,6 @@ def collect_rules(sg, direction="inbound"):
             proto_raw = rule.get("IpProtocol")
             proto = normalize_protocol(proto_raw)
             port_str = format_port_range(proto_raw, rule.get("FromPort"), rule.get("ToPort"))
-
             for ip_range in rule.get("IpRanges", []):
                 results.append((proto, port_str, ip_range.get("CidrIp"), "IPv4", ip_range.get("Description", "")))
             for ip_range in rule.get("Ipv6Ranges", []):
@@ -75,12 +65,10 @@ def collect_rules(sg, direction="inbound"):
             for pair in rule.get("UserIdGroupPairs", []):
                 display = f"sg:{pair.get('GroupId')}" if pair.get("GroupId") else pair.get("UserId", "")
                 results.append((proto, port_str, display, "SecurityGroup", pair.get("Description", "")))
-
     except Exception as e:
         logging.error(f"Error collecting {direction} rules: {e}")
     return results
 
-# ------------------- Merge Selected Columns -------------------
 def merge_selected_columns(file_path, merge_columns):
     wb = load_workbook(file_path)
     ws = wb.active
@@ -108,25 +96,21 @@ def merge_selected_columns(file_path, merge_columns):
 
     wb.save(file_path)
 
-# ------------------- Scan One Region -------------------
 def scan_region(region):
     results = []
     try:
         ec2 = session.client("ec2", region_name=region, config=config)
 
-        # Collect Subnet Metadata with Route Table Check
+        # Build subnet map for LB subnets
         subnet_map = {}
         try:
             subnets = []
             for page in ec2.get_paginator("describe_subnets").paginate():
                 subnets.extend(page["Subnets"])
-
             vpc_ids = list({s["VpcId"] for s in subnets}) if subnets else []
             route_tables = []
             for vpc_id in vpc_ids:
-                for page in ec2.get_paginator("describe_route_tables").paginate(
-                    Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
-                ):
+                for page in ec2.get_paginator("describe_route_tables").paginate(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]):
                     route_tables.extend(page["RouteTables"])
 
             subnet_to_rtb, main_rtb_per_vpc = {}, {}
@@ -151,40 +135,9 @@ def scan_region(region):
         except Exception as e:
             logging.warning(f"[Subnet] {region} {e}")
 
+        # Get all SGs
         sgs = ec2.describe_security_groups().get("SecurityGroups", [])
         sg_map = {sg["GroupId"]: [] for sg in sgs}
-
-        # ENI
-        try:
-            paginator = ec2.get_paginator("describe_network_interfaces")
-            for page in paginator.paginate():
-                for eni in page["NetworkInterfaces"]:
-                    subnet_id = eni.get("SubnetId")
-                    subnet_name, subnet_type = subnet_map.get(subnet_id, ("", ""))
-                    desc = eni.get("Description", "")
-                    name = next((t["Value"] for t in eni.get("TagSet", []) if t["Key"] == "Name"), desc)
-                    for sg in eni.get("Groups", []):
-                        sgid = sg["GroupId"]
-                        if sgid in sg_map:
-                            sg_map[sgid].append(("ENI", eni["NetworkInterfaceId"], name, subnet_id, subnet_name, subnet_type))
-        except Exception as e:
-            logging.warning(f"[ENI] {region} {e}")
-
-        # EC2
-        try:
-            paginator = ec2.get_paginator("describe_instances")
-            for page in paginator.paginate():
-                for res in page["Reservations"]:
-                    for inst in res["Instances"]:
-                        subnet_id = inst.get("SubnetId")
-                        subnet_name, subnet_type = subnet_map.get(subnet_id, ("", ""))
-                        name = next((t["Value"] for t in inst.get("Tags", []) if t["Key"] == "Name"), "")
-                        for sg in inst.get("SecurityGroups", []):
-                            sgid = sg["GroupId"]
-                            if sgid in sg_map:
-                                sg_map[sgid].append(("EC2", inst["InstanceId"], name, subnet_id, subnet_name, subnet_type))
-        except Exception as e:
-            logging.warning(f"[EC2] {region} {e}")
 
         # Classic ELB
         try:
@@ -194,7 +147,9 @@ def scan_region(region):
                 for lb in page.get("LoadBalancerDescriptions", []):
                     for sgid in lb.get("SecurityGroups", []):
                         if sgid in sg_map:
-                            sg_map[sgid].append(("Classic ELB", lb["LoadBalancerName"], lb.get("DNSName", ""), "", "", ""))
+                            for subnet_id in lb.get("Subnets", []):
+                                subnet_name, subnet_type = subnet_map.get(subnet_id, ("", ""))
+                                sg_map[sgid].append(("Classic ELB", lb["LoadBalancerName"], lb.get("DNSName", ""), subnet_id, subnet_name, subnet_type))
         except Exception as e:
             logging.warning(f"[ELB] {region} {e}")
 
@@ -206,7 +161,9 @@ def scan_region(region):
                 for lb in page.get("LoadBalancers", []):
                     for sgid in lb.get("SecurityGroups", []):
                         if sgid in sg_map:
-                            sg_map[sgid].append(("ALB/NLB", lb["LoadBalancerName"], lb.get("DNSName", ""), "", "", ""))
+                            for subnet_id in lb.get("AvailabilityZones", []):
+                                subnet_name, subnet_type = subnet_map.get(subnet_id["SubnetId"], ("", ""))
+                                sg_map[sgid].append(("ALB/NLB", lb["LoadBalancerName"], lb.get("DNSName", ""), subnet_id["SubnetId"], subnet_name, subnet_type))
         except Exception as e:
             logging.warning(f"[ALB/NLB] {region} {e}")
 
@@ -231,15 +188,12 @@ def scan_region(region):
                                     res_type, res_id, res_name,
                                     subnet_name, subnet_id, subnet_type,
                                     proto, port_str, cidr, ip_ver, desc, "OUTBOUND"])
-
     except EndpointConnectionError:
         logging.warning(f"Region {region} not available")
     except Exception as e:
         logging.error(f"[{region}] Unexpected error: {e}")
-
     return results
 
-# ------------------- Main -------------------
 def main():
     inbound_data, outbound_data = [], []
     regions = [r["RegionName"] for r in ec2_client.describe_regions()["Regions"]]
