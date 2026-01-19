@@ -13,8 +13,8 @@ import boto3
 from botocore.exceptions import ClientError, BotoCoreError
 
 MAX_THREADS = 15
-DEFAULT_PROFILE = "awsgov"
-DEFAULT_OUTPUT = "s3_buckets_reportawsgov.csv"
+DEFAULT_PROFILE = "audit"
+DEFAULT_OUTPUT = "s3_buckets_report-audit.csv"
 
 logging.basicConfig(
     level=logging.INFO,
