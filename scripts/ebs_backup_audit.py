@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 # =============================
 MAX_THREADS = int(os.getenv("MAX_THREADS", 15))
 DEFAULT_PROFILE = os.getenv("DEFAULT_PROFILE", "linko")
-DEFAULT_OUTPUT = os.getenv("DEFAULT_OUTPUT", "s3_buckets_report-linko.xlsx")
+DEFAULT_OUTPUT = os.getenv("DEFAULT_OUTPUT", "ebs-backup-audit-linko.xlsx")
 
 TARGET_REGIONS = {
     "us-east-1": "N. Virginia",
@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # =============================
 # HELPERS
 # =============================
-def session(profile, region):
+def aws_session(profile, region):
     return boto3.Session(profile_name=profile, region_name=region)
 
 
@@ -48,6 +48,10 @@ def to_naive(dt):
 
 def days_ago(dt):
     return (datetime.now(timezone.utc) - dt).days if dt else ""
+
+
+def get_account_id(session):
+    return session.client("sts").get_caller_identity()["Account"]
 
 
 # =============================
@@ -83,22 +87,27 @@ def classify_snapshots(snaps):
 
 
 # =============================
-# AWS BACKUP RETENTION
+# AWS BACKUP RETENTION (FIXED)
 # =============================
 def get_aws_backup_retention(session, region, volume_arn):
     backup = session.client("backup", region)
+
     try:
-        rps = backup.list_recovery_points_by_resource(
-            ResourceArn=volume_arn
-        )["RecoveryPoints"]
+        protected = backup.list_protected_resources()["Results"]
 
-        if not rps:
-            return "-"
+        for res in protected:
+            if res["ResourceArn"] == volume_arn:
+                plan_id = res["BackupPlanId"]
+                plan = backup.get_backup_plan(BackupPlanId=plan_id)
+                rules = plan["BackupPlan"]["Rules"]
 
-        rp = rps[0]
-        lifecycle = rp.get("Lifecycle", {})
-        return lifecycle.get("DeleteAfterDays", "-")
-    except Exception:
+                if rules:
+                    lifecycle = rules[0].get("Lifecycle", {})
+                    return lifecycle.get("DeleteAfterDays", "-")
+
+        return "-"
+    except Exception as e:
+        logger.warning(f"[{region}] AWS Backup retention lookup failed: {e}")
         return "-"
 
 
@@ -109,9 +118,8 @@ def get_dlm_retention(session, region, policy_id):
     dlm = session.client("dlm", region)
     try:
         policy = dlm.get_lifecycle_policy(PolicyId=policy_id)["Policy"]
-        rules = policy["PolicyDetails"]["Schedules"]
-        retain = rules[0]["RetainRule"].get("Count")
-        return retain
+        schedules = policy["PolicyDetails"]["Schedules"]
+        return schedules[0]["RetainRule"].get("Count", "-")
     except Exception:
         return "-"
 
@@ -123,15 +131,16 @@ def process_region(region, profile):
     rows = []
 
     try:
-        sess = session(profile, region)
+        sess = aws_session(profile, region)
         ec2 = sess.client("ec2")
+        account_id = get_account_id(sess)
 
         volumes = ec2.describe_volumes()["Volumes"]
         logger.info(f"[{region}] Found {len(volumes)} volumes")
 
         for volume in volumes:
             volume_id = volume["VolumeId"]
-            volume_arn = f"arn:aws:ec2:{region}:{sess.client('sts').get_caller_identity()['Account']}:volume/{volume_id}"
+            volume_arn = f"arn:aws:ec2:{region}:{account_id}:volume/{volume_id}"
 
             attachments = volume.get("Attachments", [])
             attached = "Yes" if attachments else "No"
@@ -140,6 +149,10 @@ def process_region(region, profile):
 
             snaps = get_snapshots(ec2, volume_id)
             aws_backup_snaps, dlm_snaps, manual_snaps = classify_snapshots(snaps)
+
+            automatic_count = len(aws_backup_snaps) + len(dlm_snaps)
+            manual_count = len(manual_snaps)
+            total_count = automatic_count + manual_count
 
             latest_snapshot = max(snaps, key=lambda x: x["StartTime"], default=None)
             oldest_snapshot = min(snaps, key=lambda x: x["StartTime"], default=None)
@@ -166,16 +179,18 @@ def process_region(region, profile):
                     "ResourceType": resource_type,
                     "ResourceName": resource_name,
 
-                    "HasAnyBackup": "YES" if snaps else "NO",
+                    "HasAnyBackup": "YES" if total_count > 0 else "NO",
                     "HasAWSBackup": "YES" if aws_backup_snaps else "NO",
                     "HasDLMBackup": "YES" if dlm_snaps else "NO",
                     "HasManualSnapshot": "YES" if manual_snaps else "NO",
 
+                    "AutomaticSnapshotCount": automatic_count,
+                    "ManualSnapshotCount": manual_count,
+                    "TotalSnapshots": total_count,
+
                     "RetentionDays": retention_days,
                     "OldestBackupDays": days_ago(oldest_snapshot["StartTime"]) if oldest_snapshot else "",
                     "LatestBackupDays": days_ago(latest_snapshot["StartTime"]) if latest_snapshot else "",
-
-                    "TotalSnapshots": len(snaps),
                     "LatestSnapshotDate": to_naive(latest_snapshot["StartTime"]) if latest_snapshot else "",
                 }
             )
@@ -207,7 +222,7 @@ def run_audit():
 
 
 # =============================
-# EXCEL
+# EXCEL OUTPUT
 # =============================
 def write_excel(rows):
     df = pd.DataFrame(rows)
@@ -217,7 +232,7 @@ def write_excel(rows):
 
 
 # =============================
-# ENTRY
+# ENTRYPOINT
 # =============================
 if __name__ == "__main__":
     try:
@@ -225,4 +240,4 @@ if __name__ == "__main__":
         write_excel(data)
         logger.info("EBS backup audit completed successfully")
     except Exception as e:
-        logger.exception(f"Fatal error: {e}")
+        logger.exception(f"Fatal error during audit: {e}")
