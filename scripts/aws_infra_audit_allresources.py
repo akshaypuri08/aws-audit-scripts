@@ -13,7 +13,7 @@ import pandas as pd
 # CONFIG
 # =========================================================
 MAX_THREADS = 15
-DEFAULT_PROFILE = "aqcn"
+DEFAULT_PROFILE = "delac"
 DEFAULT_OUTPUT = "aws_infra_audit"
 lock = threading.Lock()
 
