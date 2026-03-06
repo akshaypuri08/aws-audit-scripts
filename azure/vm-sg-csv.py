@@ -7,9 +7,9 @@ from datetime import datetime, UTC
 # HARD-CODED DUMMY SERVICE PRINCIPAL CREDENTIALS
 # ===================================================
 
-CLIENT_ID = "0e08c3c0-0970-4e64-9f92-cb421f937c69"
-CLIENT_SECRET = "BO58Q~~prMX-5Far9jpk06swf4nosSg2.zGceaVi"
-TENANT_ID = "2c518df7-6644-41f8-8350-3f75e61362ac"
+CLIENT_ID = ""
+CLIENT_SECRET = ""
+TENANT_ID = ""
 
 CLIENT_SECRET_ESCAPED = CLIENT_SECRET.replace('"', '\\"')
 
@@ -26,7 +26,7 @@ print("Authentication successful.\n")
 # SET TARGET SUBSCRIPTION
 # ===================================================
 
-SUBSCRIPTION_NAME = "aqi-prod"
+SUBSCRIPTION_NAME = ""
 print(f"Setting subscription to: {SUBSCRIPTION_NAME}")
 
 subprocess.run(
