@@ -9,10 +9,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # -------------------------
 # CONFIG
 # -------------------------
-AWS_PROFILE = "aqcn"   # Change this
+AWS_PROFILE = "linko"   # Change this
 TARGET_PORTS = {20, 21, 22, 3389, 5432}
-INBOUND_FILE = "621924646669_security_groups_in_use_selected_ports.xlsx"
-OUTBOUND_FILE = "621924646669_security_groups_in_use_selected_ports_outbound.xlsx"
+INBOUND_FILE = "linko_security_groups_in_use_selected_ports.xlsx"
+OUTBOUND_FILE = "linko_security_groups_in_use_selected_ports_outbound.xlsx"
 MAX_THREADS = 5  # Number of regions scanned in parallel
 # -------------------------
 

@@ -7,9 +7,9 @@ from openpyxl.utils import get_column_letter
 # ---------------- Logging Setup ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-PROFILE_NAME = "aqcn"
-OUTPUT_INBOUND = "sg_inbound.xlsx"
-OUTPUT_OUTBOUND = "sg_outbound.xlsx"
+PROFILE_NAME = "linko"
+OUTPUT_INBOUND = "sg_linko_inbound.xlsx"
+OUTPUT_OUTBOUND = "sg_linko_outbound.xlsx"
 
 # ---------------- AWS Session ----------------
 try:

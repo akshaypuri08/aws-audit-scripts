@@ -7,9 +7,9 @@ from botocore.exceptions import EndpointConnectionError
 from botocore.config import Config
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-AWS_PROFILE = "aqcn"
-INBOUND_FILE = "ec2_security_groups_inbound.xlsx"
-OUTBOUND_FILE = "ec2_security_groups_outbound.xlsx"
+AWS_PROFILE = "linko"
+INBOUND_FILE = "ec2_security_groups_inbound_linko.xlsx"
+OUTBOUND_FILE = "ec2_security_groups_outbound_linko.xlsx"
 MAX_THREADS = 5
 
 logging.basicConfig(

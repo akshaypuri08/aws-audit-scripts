@@ -14,18 +14,28 @@ from botocore.exceptions import ClientError, BotoCoreError
 # CONFIG (ENV OVERRIDES)
 # =========================================================
 MAX_THREADS = int(os.getenv("MAX_THREADS", 15))
-DEFAULT_PROFILE = os.getenv("AWS_PROFILE", "tokay")
+DEFAULT_PROFILE = os.getenv("AWS_PROFILE", "aqi")
 DEFAULT_OUTPUT = os.getenv(
     "DEFAULT_OUTPUT",
-    "ebs_backup_and_snapshot_audit_tokay.xlsx"
+    "ebs_backup_and_snapshot_audit_aqi.xlsx"
 )
+
+# TARGET_REGIONS = {
+#     "us-east-1": "N. Virginia",
+#     "eu-west-1": "Ireland",
+#     "ap-southeast-2": "Sydney",
+#     "ca-central-1": "Canada Central",
+# }
 
 TARGET_REGIONS = {
     "us-east-1": "N. Virginia",
+    "us-west-1": "N. california",
     "eu-west-1": "Ireland",
+    "ap-southeast-1": "singapore",
     "ap-southeast-2": "Sydney",
     "ca-central-1": "Canada Central",
 }
+
 
 # =========================================================
 # LOGGING

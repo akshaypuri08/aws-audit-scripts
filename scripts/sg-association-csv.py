@@ -9,8 +9,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-PROFILE_NAME = "aqcn"
-OUTPUT_FILE = "in_use_security_groups_all.csv"
+PROFILE_NAME = "linko"
+OUTPUT_FILE = "in_use_security_groups_all_linko.csv"
 
 # ---------------- AWS Session ----------------
 try:
